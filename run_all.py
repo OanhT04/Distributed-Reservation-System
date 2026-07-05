@@ -3,6 +3,8 @@ run_all.py - Start the entire system.
 
 Terminal 1: python run_all.py
 Terminal 2: python client/client.py
+- Ctrl+C to stop the system when done.
+- For viewing logs, run in a separate terminal:
 """
 
 import sys
@@ -62,7 +64,9 @@ def main():
     print()
     print("  All services started!")
     print()
-    print("  Run client:  python client/client.py")
+    print("  Landing:     http://127.0.0.1:5000/")
+    print("  Web app:     http://127.0.0.1:5000/app")
+    print("  CLI client:  python client/client.py")
     print("  Press Ctrl+C to stop.")
     print()
 

@@ -1,30 +1,54 @@
 """
-gateway.py - API Gateway (REST to TCP bridge) 
+gateway.py - API Gateway (REST to TCP bridge)
 sendToService() bridges HTTP to TCP.
 getServiceAddress() does routing/service discovery.
 All REST routes fully working.
 """
 
+import os
 import socket
 import json
 import logging
+from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_DIR = Path(PROJECT_ROOT) / "frontend"
+
 from common.config import (
     GATEWAY_HOST, GATEWAY_PORT,
-    RESTAURANT_SERVICE_MAP
+    RESTAURANT_SERVICE_MAP, BACKUP_MAP,
+    REPLICATION_HOST,
 )
 from common.protocol import sendMessage, receiveMessage
 
 logger = logging.getLogger(__name__)
 
+STATIC_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+}
 
-def sendToService(host, port, message):
-    """Bridge from HTTP to TCP. Opens TCP connection to correct service and forwards request."""
+#only when primary is alive; but not responsive;
+PRIMARY_TIMEOUT = 3.0
+
+
+BACKUP_TIMEOUT  = 10.0
+
+
+def sendToService(host, port, message, timeout=BACKUP_TIMEOUT):
+    """Bridge from HTTP to TCP.
+
+    Opens a TCP connection to the target service, sends the message using the
+    shared newline-framed protocol, returns parsed response dict.
+    The caller controls the timeout so primary and backup attempts can use
+    different values (see sendToServiceWithFailover).
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10.0)
+        sock.settimeout(timeout)
         sock.connect((host, port))
         sendMessage(sock, message)
         response = receiveMessage(sock)
@@ -35,8 +59,26 @@ def sendToService(host, port, message):
         return {"status": "error", "message": f"Service unavailable: {e}"}
 
 
+def sendToServiceWithFailover(host, port, message):
+    """Try primary first with a short timeout; fall over to backup on failure.
+
+    Using PRIMARY_TIMEOUT (3s) for the primary probe means a dead primary is
+    detected quickly.  The total worst-case client delay after a primary death
+    is PRIMARY_TIMEOUT + BACKUP_TIMEOUT = 13s, which is acceptable for this demo but could be improved in a production system
+    """
+    response = sendToService(host, port, message, timeout=PRIMARY_TIMEOUT)
+    if response.get("status") == "error" and "unavailable" in response.get("message", ""):
+        backup_port = BACKUP_MAP.get(port)
+        if backup_port is not None:
+            logger.warning(
+                f"Primary {host}:{port} unavailable — retrying on backup port {backup_port}"
+            )
+            response = sendToService(REPLICATION_HOST, backup_port, message, timeout=BACKUP_TIMEOUT)
+    return response
+
+
 def getServiceAddress(restaurant_id):
-    """Routing/service discovery. Uses restaurant service map from config."""
+    """Routing/service discovery. Looks up host and port from RESTAURANT_SERVICE_MAP in config."""
     return RESTAURANT_SERVICE_MAP.get(restaurant_id)
 
 
@@ -46,6 +88,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         logger.info(f"HTTP {args[0]}")
 
     def _sendJson(self, status_code, data):
+        # Send a JSON response with the specified status code.
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -53,21 +96,65 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data, indent=2).encode())
 
     def _readBody(self):
+        # Read and parse JSON body from the request. Returns dict or None if invalid.
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             return {}
-        return json.loads(self.rfile.read(content_length).decode())
+        try:
+            return json.loads(self.rfile.read(content_length).decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+    def _serveStatic(self, filename, content_type):
+        filepath = FRONTEND_DIR / filename
+        if not filepath.is_file():
+            self._sendJson(404, {"error": "Not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        self.wfile.write(filepath.read_bytes())
+
+    def _serveStaticPath(self, relative_path):
+        """Serve a file from frontend/ subdirectories (css/, js/, etc.)."""
+        base = FRONTEND_DIR.resolve()
+        target = (base / relative_path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            self._sendJson(404, {"error": "Not found"})
+            return
+        if not target.is_file():
+            self._sendJson(404, {"error": "Not found"})
+            return
+        ext = target.suffix.lower()
+        content_type = STATIC_MIME.get(ext, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+        self.wfile.write(target.read_bytes())
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
 
+        # Serve web frontend
+        if path in ("/", "/index.html"):
+            self._serveStatic("index.html", "text/html; charset=utf-8")
+            return
+        if path in ("/app", "/app.html"):
+            self._serveStatic("app.html", "text/html; charset=utf-8")
+            return
+        if path.startswith("/css/") or path.startswith("/js/"):
+            self._serveStaticPath(path[1:])
+            return
+
         # GET /restaurants
         if path == "/restaurants":
             restaurants = []
             for rid, (host, port) in RESTAURANT_SERVICE_MAP.items():
-                resp = sendToService(host, port, {"action": "get_info"})
+                resp = sendToServiceWithFailover(host, port, {"action": "get_info"})
                 if resp.get("status") == "ok":
                     restaurants.append({
                         "restaurant_id": rid,
@@ -91,11 +178,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not addr:
                 self._sendJson(404, {"error": f"Restaurant '{rid}' not found"})
                 return
-            resp = sendToService(addr[0], addr[1], {
+            resp = sendToServiceWithFailover(addr[0], addr[1], {
                 "action": "check_availability",
                 "date": query.get("date", [""])[0],
                 "timeslot": query.get("timeslot", [""])[0],
-                "party_size": int(query.get("party_size", [1])[0]),
+                "party_size": int(query.get("party_size", [1])[0]) if str(query.get("party_size", [1])[0]).isdigit() else 1,
             })
             self._sendJson(200, resp)
 
@@ -106,7 +193,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not addr:
                 self._sendJson(404, {"error": f"Restaurant '{rid}' not found"})
                 return
-            resp = sendToService(addr[0], addr[1], {"action": "get_info"})
+            resp = sendToServiceWithFailover(addr[0], addr[1], {"action": "get_info"})
             self._sendJson(200, resp)
 
         # GET /reservations/<restaurant_id>
@@ -116,7 +203,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not addr:
                 self._sendJson(404, {"error": f"Restaurant '{rid}' not found"})
                 return
-            resp = sendToService(addr[0], addr[1], {
+            resp = sendToServiceWithFailover(addr[0], addr[1], {
                 "action": "list_reservations",
                 "date": query.get("date", [None])[0],
             })
@@ -128,6 +215,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         body = self._readBody()
+        # Return 400 if body is not valid JSON or is missing entirely.
+        if body is None:
+            self._sendJson(400, {"error": "Invalid JSON body"})
+            return
 
         # POST /reservations
         if path == "/reservations":
@@ -139,7 +230,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not addr:
                 self._sendJson(404, {"error": f"Restaurant '{rid}' not found"})
                 return
-            resp = sendToService(addr[0], addr[1], {
+            resp = sendToServiceWithFailover(addr[0], addr[1], {
                 "action": "book",
                 "table_id": body.get("table_id"),
                 "date": body.get("date"),
@@ -157,14 +248,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = urlparse(self.path).path
         body = self._readBody()
+        
+        if body is None:
+            self._sendJson(400, {"error": "Invalid JSON body"})
+            return
 
+        # DELETE /reservations
         if path == "/reservations":
             rid = body.get("restaurant_id")
+            if not rid:
+                self._sendJson(400, {"error": "restaurant_id is required"})
+                return
             addr = getServiceAddress(rid)
             if not addr:
                 self._sendJson(404, {"error": f"Restaurant '{rid}' not found"})
                 return
-            resp = sendToService(addr[0], addr[1], {
+            resp = sendToServiceWithFailover(addr[0], addr[1], {
                 "action": "cancel",
                 "table_id": body.get("table_id"),
                 "date": body.get("date"),

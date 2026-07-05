@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tabletop — Restaurant Reservations</title>
+  <link rel="stylesheet" href="/css/common.css">
+  <link rel="stylesheet" href="/css/landing.css">
+</head>
+<body>
+  <nav class="topnav">
+    <a href="/" class="logo">Tabletop</a>
+    <div class="topnav-links">
+      <a href="#features">How it works</a>
+      <a href="#restaurants">Restaurants</a>
+      <a href="/app" class="btn btn-primary" style="color: white;">Book a table</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <div>
+      <h1>Reserve your table at the <em>perfect</em> restaurant</h1>
+      <p class="lead">
+        Browse local dining spots, check real-time availability, and book in seconds.
+        Manage or cancel reservations anytime.
+      </p>
+      <div class="hero-actions">
+        <a href="/app" class="btn btn-primary">Find a table</a>
+        <a href="/app#mine" class="btn btn-outline">My reservations</a>
+      </div>
+    </div>
+    <div class="hero-visual">
+      <div class="tag">Featured tonight</div>
+      <h2 id="featuredName">Loading…</h2>
+      <p id="featuredDesc">Connecting to restaurants near you.</p>
+    </div>
+  </section>
+
+  <div class="stats">
+    <div class="stat">
+      <strong id="statRestaurants">—</strong>
+      <span>Restaurants</span>
+    </div>
+    <div class="stat">
+      <strong id="statCuisines">—</strong>
+      <span>Cuisines</span>
+    </div>
+    <div class="stat">
+      <strong>7</strong>
+      <span>Days ahead booking</span>
+    </div>
+    <div class="stat">
+      <strong>24/7</strong>
+      <span>Manage online</span>
+    </div>
+  </div>
+
+  <section class="section" id="features">
+    <div class="section-header">
+      <h2>How it works</h2>
+      <p>Three simple steps from browsing to your reserved table</p>
+    </div>
+    <div class="features">
+      <article class="feature">
+        <div class="feature-icon">🍽</div>
+        <h3>Browse &amp; discover</h3>
+        <p>Explore restaurants by cuisine, rating, and location. View menus, seating areas, and hours.</p>
+      </article>
+      <article class="feature">
+        <div class="feature-icon">📅</div>
+        <h3>Pick your time</h3>
+        <p>Choose a date within the next week, select a timeslot, and we'll match you to the best available table.</p>
+      </article>
+      <article class="feature">
+        <div class="feature-icon">✓</div>
+        <h3>Book instantly</h3>
+        <p>Confirm your reservation in one click. View or cancel bookings anytime from your account.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="restaurants">
+    <div class="section-header">
+      <h2>Our restaurants</h2>
+      <p id="restaurantSubtitle">Hand-picked dining experiences</p>
+    </div>
+    <div class="restaurant-grid" id="restaurantGrid">
+      <p class="sans loading-msg">Loading restaurants…</p>
+    </div>
+    <div class="section-cta">
+      <a href="/app" class="btn btn-primary">View all &amp; book</a>
+    </div>
+  </section>
+
+  <section class="cta">
+    <h2>Ready to dine?</h2>
+    <p>Your next great meal is one reservation away.</p>
+    <a href="/app" class="btn">Book now</a>
+  </section>
+
+  <footer class="landing-footer">
+    Tabletop Reservation System &mdash; Distributed restaurant booking demo
+  </footer>
+
+  <script src="/js/utils.js"></script>
+  <script src="/js/landing.js"></script>
+</body>
+</html>

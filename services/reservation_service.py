@@ -35,6 +35,9 @@ class ReservationService:
         self.reservations = {}
         self.running = False
 
+        # One lock per table so independent tables can be booked concurrently.
+        # Only the specific table being written is locked; all other tables
+        # remain available throughout the operation.
         self.table_locks = {}
         for table_id in self.restaurant_info["tables"]:
             self.table_locks[table_id] = threading.Lock()
@@ -52,12 +55,26 @@ class ReservationService:
         self._on_heartbeat = None
         self._is_promoted_primary = False
 
+    # ── Lamport clock helpers ──────────────────────────────────────
+
     def _next_lamport(self):
+        """Increment and return the local Lamport timestamp under clock_lock.
+
+        callers inside _bookTable / _cancelReservation must call this while already holding the table lock. 
+        To ensure the timestamp is assigned at the exact moment of the write, keeping theLamport ordering consistent with the actual reservation order.
+        """
         with self.clock_lock:
             self.logical_clock += 1
             return self.logical_clock
 
     def _advance_lamport_from_peer(self, ts):
+        """Update clock on the backup when a replicated write arrives.
+
+        Lamport rule: new_clock = max(local, peer) + 1.
+        This keeps the backup's clock strictly ahead of every timestamp it has
+        stored, so any future write on the backup (after promotion) will have a
+        higher timestamp than all previously replicated records.
+        """
         if ts is None:
             return
         try:
@@ -65,7 +82,9 @@ class ReservationService:
         except (TypeError, ValueError):
             return
         with self.clock_lock:
-            self.logical_clock = max(self.logical_clock, t)
+            self.logical_clock = max(self.logical_clock, t) + 1
+
+    # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self):
         self.running = True
@@ -81,6 +100,8 @@ class ReservationService:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((self.host, self.port))
         server.listen(20)
+        # 1-second accept() timeout lets the while-loop check self.running
+        # frequently so a stop() call is reflected within about 1 second.
         server.settimeout(1.0)
         logger.info(f"[{self.restaurant_info['name']}] on {self.host}:{self.port}")
 
@@ -98,24 +119,40 @@ class ReservationService:
         self._heartbeat_stop.set()
 
     def set_heartbeat_observer(self, fn):
-        """Called on backup when a heartbeat TCP message is received from the primary."""
+        """Register callback invoked each time a heartbeat TCP message arrives (backup only)."""
         self._on_heartbeat = fn
 
     def promote_to_primary(self):
-        """Backup takes over as authoritative node (no longer back_up-only)."""
+        """Backup takes over as the authoritative node after primary failure.
+
+        Flips back_up=False so that subsequent writes replicate forward and
+        are confirmed to the client normally.  BACKUP_MAP only contains primary
+        ports as keys, so BACKUP_MAP.get(self.port) returns None for a backup port 
+        """
+        
         if self._is_promoted_primary:
             return
         self._is_promoted_primary = True
         self.back_up = False
-        self._on_heartbeat = None
+        self._on_heartbeat = None  # Stop processing heartbeats from dead primary
+
         backup_target = BACKUP_MAP.get(self.port)
         if backup_target is not None:
             self.replicator = PrimaryReplicator(REPLICATION_HOST, backup_target)
         else:
-            self.replicator = None
+            # Backup ports are not keys in BACKUP_MAP, so promoted nodes have no backup to replicate to.
+            logger.warning(
+                "Promoted primary on %s:%s has no backup — BACKUP_MAP contains no "
+                "entry for port %s.  Data is now unreplicated.",
+                self.host, self.port, self.port,
+            )
         logger.warning("Backup promoted to primary on %s:%s", self.host, self.port)
 
+    # ── Request dispatcher ────────────────────────────────────────
+
     def _handleClient(self, conn, addr):
+        # Dispatcher for incoming TCP messages.  
+        # Each message is handled in a new thread, so multiple requests can be processed concurrently.
         try:
             msg = receiveMessage(conn)
             action = msg.get("action")
@@ -123,7 +160,7 @@ class ReservationService:
             if action == "heartbeat":
                 if self._on_heartbeat:
                     self._on_heartbeat()
-                response = {"status": "ok", "message": "pong"}
+                response = {"status": "ok", "message": "pong"} 
             elif action == "apply_replication":
                 response = self._applyReplication(msg)
             elif action == "get_info":
@@ -168,21 +205,25 @@ class ReservationService:
         }
 
     def _applyReplication(self, msg):
-        """Apply a replicated write from the primary (backup node)."""
+        """Apply a replicated write that arrived from the primary (backup node only)."""
         operation = msg.get("operation")
         key_parts = msg.get("key")
         if operation not in ("book", "cancel") or not isinstance(key_parts, list) or len(key_parts) != 3:
+            logger.error(f"REPLICATION INVALID: bad payload received — {msg}")
             return {"status": "error", "message": "Invalid replication payload"}
         _, table_id, _ = key_parts
         if table_id not in self.table_locks:
+            logger.error(f"REPLICATION INVALID: unknown table {table_id}")
             return {"status": "error", "message": "Unknown table"}
 
         lock = self.table_locks[table_id]
         if not lock.acquire(timeout=LOCK_TIMEOUT):
+            logger.warning(f"LOCK TIMEOUT: replication could not acquire lock for {table_id}")
             return {"status": "error", "message": "Lock timeout"}
 
         try:
             key = tuple(key_parts)
+            logger.info(f"REPLICATION RECEIVED: {operation} {list(key)} from primary")
             if operation == "book":
                 reservation = msg.get("reservation") or {}
                 self._advance_lamport_from_peer(reservation.get("lamport_ts"))
@@ -192,6 +233,7 @@ class ReservationService:
                 if isinstance(res, dict):
                     self._advance_lamport_from_peer(res.get("lamport_ts"))
                 self.reservations.pop(key, None)
+            logger.info(f"REPLICATION APPLIED: {operation} on {list(key)}")
             return {"status": "ok"}
         finally:
             lock.release()
@@ -222,6 +264,13 @@ class ReservationService:
         }
 
     def _replicate_book(self, key, reservation):
+        """Forward a booking to the backup before confirming to the client.
+
+        Returns True if replication succeeded (or is not needed), False on
+        failure.  Returning False causes _bookTable to reject the booking —
+        this is the safety-first choice: we never confirm a write that the
+        backup hasn't acknowledged.
+        """
         if self.replicator is None or self.back_up:
             return True
         return self.replicator.replicate(
@@ -234,6 +283,7 @@ class ReservationService:
         )
 
     def _replicate_cancel(self, key, cancelled_snapshot):
+        """Forward a cancellation to the backup before confirming to the client."""
         if self.replicator is None or self.back_up:
             return True
         return self.replicator.replicate(
@@ -259,13 +309,17 @@ class ReservationService:
         lock = self.table_locks[table_id]
         got = lock.acquire(timeout=LOCK_TIMEOUT)
         if not got:
+            logger.warning(f"LOCK TIMEOUT: could not acquire lock for {table_id} ({self.restaurant_id})")
             return {"status": "error", "message": "Could not acquire table lock (timed out)"}
 
         try:
             key = (self.restaurant_id, table_id, f"{date}_{timeslot}")
             if key in self.reservations:
+                logger.info(f"BOOK REJECTED: {table_id} at {date} {timeslot} already booked ({self.restaurant_id})")
                 return {"status": "error", "message": f"Table {table_id} at {timeslot} is already booked"}
 
+            # timestamp assigned- write happens atomically
+            # under the same lock.
             lamport_ts = self._next_lamport()
             reservation = {
                 "restaurant_id": self.restaurant_id,
@@ -280,10 +334,11 @@ class ReservationService:
             }
 
             if not self._replicate_book(key, reservation):
+                logger.error(f"REPLICATION FAILED: book {table_id} at {date} {timeslot} ({self.restaurant_id})")
                 return {"status": "error", "message": "Backup replication failed"}
 
             self.reservations[key] = reservation
-            logger.info(f"BOOKED: {customer_name} -> {table_id} at {date} {timeslot}")
+            logger.info(f"BOOKED: {customer_name} -> {table_id} at {date} {timeslot} (lamport={lamport_ts})")
 
             return {"status": "ok", "message": "Reservation confirmed!", "reservation": reservation}
         finally:
@@ -302,20 +357,25 @@ class ReservationService:
         lock = self.table_locks[table_id]
         got = lock.acquire(timeout=LOCK_TIMEOUT)
         if not got:
+            logger.warning(f"LOCK TIMEOUT: could not acquire lock for {table_id} ({self.restaurant_id})")
             return {"status": "error", "message": "Could not acquire table lock (timed out)"}
 
         try:
             if key not in self.reservations:
+                logger.info(f"CANCEL REJECTED: no reservation found for {table_id} at {date} {timeslot}")
                 return {"status": "error", "message": "No reservation found to cancel"}
 
             cancelled = dict(self.reservations[key])
+            # Lamport clock is incremented inside the lock here too. 
+            # The timestamp assigned at the exact moment of the write to maintain ordering correctness.
             cancelled["lamport_ts"] = self._next_lamport()
 
             if not self._replicate_cancel(key, cancelled):
+                logger.error(f"REPLICATION FAILED: cancel {table_id} at {date} {timeslot} ({self.restaurant_id})")
                 return {"status": "error", "message": "Backup replication failed"}
 
             del self.reservations[key]
-            logger.info(f"CANCELLED: {table_id} at {date} {timeslot}")
+            logger.info(f"CANCELLED: {table_id} at {date} {timeslot} (lamport={cancelled['lamport_ts']})")
 
             return {"status": "ok", "message": "Reservation cancelled", "cancelled": cancelled}
         finally:

@@ -18,6 +18,7 @@ from tests.test_automatic import (
     LamportClockTests,
     HeartbeatMonitorTests,
     PrimaryServerFailureTests,
+    ServiceMapUpdateTests,
 )
 
 
@@ -26,6 +27,7 @@ TEST_CLASSES = {
     "2": ("Lamport Clock Tests", LamportClockTests),
     "3": ("Heartbeat Monitor Tests", HeartbeatMonitorTests),
     "4": ("Primary Server Failure Tests", PrimaryServerFailureTests),
+    "5": ("Service Map Update Tests", ServiceMapUpdateTests),
     # "3": ("Logger Tests", LoggerTests),
     "0": ("Exit", None),
 }
@@ -61,6 +63,8 @@ def main() -> int:
 
     loader = unittest.TestLoader()
 
+    last_result = 0
+
     while True:
         print_menu()
 
@@ -73,7 +77,9 @@ def main() -> int:
         elif choice in TEST_CLASSES:
             name, test_class = TEST_CLASSES[choice]
             print(f"\nRunning: {name}\n")
-            run_suite(loader.loadTestsFromTestCase(test_class))
+            last_result = run_suite(loader.loadTestsFromTestCase(test_class))
+
+    return last_result
 
 if __name__ == "__main__":
     raise SystemExit(main())
